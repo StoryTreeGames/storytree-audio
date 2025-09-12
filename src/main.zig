@@ -3,54 +3,6 @@ const audio = @import("audio");
 const windows = @import("windows");
 const win32 = windows.win32;
 
-// Print to stdout ignoring any errors
-//
-// Windows will do an additional allocation to convert the output to utf16 to
-// allow for unicode characters to display properly to terminals.
-pub fn print(comptime fmt: []const u8, args: anytype) void {
-    if (@import("builtin").target.os.tag == .windows) {
-        const r = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
-        defer std.heap.page_allocator.free(r);
-
-        const u = std.unicode.utf8ToUtf16LeAlloc(std.heap.page_allocator, r) catch return;
-        defer std.heap.page_allocator.free(u);
-
-        const h = std.os.windows.GetStdHandle(std.os.windows.STD_OUTPUT_HANDLE) catch unreachable;
-        var written: u32 = 0;
-        _ = std.os.windows.kernel32.WriteConsoleW(h, u.ptr, @intCast(u.len), &written, null);
-    } else {
-        const stdout = std.fs.File.stdout();
-        var buffer: [1024]u8 = undefined;
-        var writer = stdout.writer(&buffer);
-        writer.interface.print(fmt, args) catch return;
-        writer.interface.flush() catch return;
-    }
-}
-
-// Print to stderr ignoring any errors
-//
-// Windows will do an additional allocation to convert the output to utf16 to
-// allow for unicode characters to display properly to terminals.
-pub fn debug(comptime fmt: []const u8, args: anytype) void {
-    if (@import("builtin").target.os.tag == .windows) {
-        const r = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
-        defer std.heap.page_allocator.free(r);
-
-        const u = std.unicode.utf8ToUtf16LeAlloc(std.heap.page_allocator, r) catch return;
-        defer std.heap.page_allocator.free(u);
-
-        const h = std.os.windows.GetStdHandle(std.os.windows.STD_ERROR_HANDLE) catch unreachable;
-        var written: u32 = 0;
-        _ = std.os.windows.kernel32.WriteConsoleW(h, u.ptr, @intCast(u.len), &written, null);
-    } else {
-        const stderr = std.fs.File.stderr();
-        var buffer: [1024]u8 = undefined;
-        var writer = stderr.writer(&buffer);
-        writer.interface.print(fmt, args) catch return;
-        writer.interface.flush() catch return;
-    }
-}
-
 const IAsyncOperation = windows.Foundation.IAsyncOperation;
 const AsyncOperationCompletedHandler = windows.Foundation.AsyncOperationCompletedHandler;
 const AsyncStatus = windows.Foundation.AsyncStatus;
