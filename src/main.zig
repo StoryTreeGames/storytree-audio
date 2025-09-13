@@ -1,6 +1,12 @@
 const std = @import("std");
 const audio = @import("audio");
 const windows = @import("windows");
+const core = @import("storytree-core");
+
+const EventLoop = core.event.EventLoop;
+const Event = core.event.Event;
+const Window = core.Window;
+
 const win32 = windows.win32;
 
 const IAsyncOperation = windows.Foundation.IAsyncOperation;
@@ -18,6 +24,8 @@ const CreateAudioDeviceOutputNodeResult = windows.Media.Audio.CreateAudioDeviceO
 const CreateAudioFileInputNodeResult = windows.Media.Audio.CreateAudioFileInputNodeResult;
 const IAudioInputNode = windows.Media.Audio.IAudioInputNode;
 const IAudioNode = windows.Media.Audio.IAudioNode;
+const IAudioEffectDefinition  = windows.Media.Effects.IAudioEffectDefinition;
+const LimiterEffectDefinition = windows.Media.Audio.LimiterEffectDefinition;
 
 const IUnknown = windows.IUnknown;
 const HSTRING = windows.HSTRING;
@@ -167,14 +175,92 @@ pub fn main() !void {
     const file_input_node = try createFileInputNode(allocator, graph, "assets/lizard.wav");
     defer _ = IUnknown.Release(@ptrCast(file_input_node));
 
-    var this: ?*IAudioNode = undefined;
-    const _c = IUnknown.QueryInterface(@ptrCast(device_output), &IAudioNode.IID, @ptrCast(&this));
-    if (this == null or _c != 0) return error.NoInterface;
+    var output: ?*IAudioNode = undefined;
+    var _c = IUnknown.QueryInterface(@ptrCast(device_output), &IAudioNode.IID, @ptrCast(&output));
+    if (output == null or _c != 0) return error.NoInterface;
 
-    try file_input_node.AddOutgoingConnection(this.?);
+    try file_input_node.AddOutgoingConnection(output.?);
+
+    const limiter = try LimiterEffectDefinition.Create(graph);
+    defer _ = IUnknown.Release(@ptrCast(limiter));
+
+    var volume: u32 = 20;
+    const gain: f64 = 10.0;
+    try limiter.putLoudness(volume);
+
+    var limiter_def: ?*IAudioEffectDefinition = undefined;
+    _c = IUnknown.QueryInterface(@ptrCast(limiter), &IAudioEffectDefinition.IID, @ptrCast(&limiter_def));
+    if (limiter_def == null or _c != 0) return error.NoInterface;
+
+    var effect_defs = try file_input_node.getEffectDefinitions();
+    defer _ = IUnknown.Release(@ptrCast(effect_defs));
+
+    try effect_defs.Append(limiter_def.?);
+
+    var playing = true;
 
     try graph.Start();
+
+    try file_input_node.putOutgoingGain(gain);
     try file_input_node.Start();
 
-    try awaitFileAudio(file_input_node);
+    // TimeSpan
+    // const end = (try file_input_node.getEndTime()).getValue();
+
+    var event_loop = try EventLoop.init(allocator);
+    defer event_loop.deinit();
+
+    var title = try std.fmt.allocPrint(allocator, "{s} - {d}%", .{ if (playing) "Playing" else "paused", volume });
+    defer allocator.free(title);
+
+    _ = try event_loop.createWindow(.{ .title=title, .width = 800, .height = 600 });
+
+    while(event_loop.isActive()) {
+        if (event_loop.poll()) |data| {
+            switch (data.event) {
+                .close => event_loop.closeWindow(data.window.id()),
+                .key_input => |ke| {
+                    if (ke.matches(.up, .{})) {
+                        if (volume == 100) continue;
+
+                        if (volume == 0) {
+                            volume = 5;
+                            try file_input_node.putOutgoingGain(gain);
+                        } else {
+                            volume = @min(volume + 5, 100);
+                            try limiter.putLoudness(volume);
+                        }
+
+                        allocator.free(title);
+                        title = try std.fmt.allocPrint(allocator, "{s} - {d}%", .{ if (playing) "Playing" else "Paused", volume });
+                        try data.window.setTitle(title);
+                    } else if (ke.matches(.down, .{})) {
+                        if (volume == 0) continue;
+
+                        if (volume == 5) {
+                            volume = 0;
+                            try file_input_node.putOutgoingGain(0.0);
+                        } else {
+                            volume -|= 5;
+                            try limiter.putLoudness(volume);
+                        }
+
+                        allocator.free(title);
+                        title = try std.fmt.allocPrint(allocator, "{s} - {d}%", .{ if (playing) "Playing" else "Paused", volume });
+                        try data.window.setTitle(title);
+                    } else if (ke.matches(' ', .{})) {
+                        defer playing = !playing;
+                        if (playing)
+                            try file_input_node.Stop()
+                        else
+                            try file_input_node.Start();
+                        allocator.free(title);
+                        title = try std.fmt.allocPrint(allocator, "{s} - {d}%", .{ if (!playing) "Playing" else "Paused", volume });
+                        try data.window.setTitle(title);
+                    }
+                },
+                else => {}
+            }
+        }
+    }
 }
