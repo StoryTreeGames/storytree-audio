@@ -1,11 +1,6 @@
 const std = @import("std");
 const audio = @import("audio");
 const windows = @import("windows");
-const core = @import("storytree-core");
-
-const EventLoop = core.event.EventLoop;
-const Event = core.event.Event;
-const Window = core.Window;
 
 const win32 = windows.win32;
 
@@ -14,6 +9,7 @@ const AsyncOperationCompletedHandler = windows.Foundation.AsyncOperationComplete
 const AsyncStatus = windows.Foundation.AsyncStatus;
 const TypedEventHandler = windows.Foundation.TypedEventHandler;
 const IInspectable = windows.Foundation.IInspectable;
+const IVector = windows.Foundation.Collections.IVector;
 
 const AudioGraph = windows.Media.Audio.AudioGraph;
 const AudioGraphSettings = windows.Media.Audio.AudioGraphSettings;
@@ -25,7 +21,11 @@ const CreateAudioFileInputNodeResult = windows.Media.Audio.CreateAudioFileInputN
 const IAudioInputNode = windows.Media.Audio.IAudioInputNode;
 const IAudioNode = windows.Media.Audio.IAudioNode;
 const IAudioEffectDefinition  = windows.Media.Effects.IAudioEffectDefinition;
+
 const LimiterEffectDefinition = windows.Media.Audio.LimiterEffectDefinition;
+const EqualizerEffectDefinition = windows.Media.Audio.EqualizerEffectDefinition;
+const ReverbEffectDefinition = windows.Media.Audio.ReverbEffectDefinition;
+const EchoEffectDefinition = windows.Media.Audio.EchoEffectDefinition;
 
 const IUnknown = windows.IUnknown;
 const HSTRING = windows.HSTRING;
@@ -88,179 +88,206 @@ fn awaitOperation(T: type, op: *IAsyncOperation(T)) !void {
     async_context.wait();
 }
 
-fn awaitFileAudio(file_input_node: *AudioFileInputNode) !void {
-    var context: AsyncContext = .{};
-    var completed_handler = try TypedEventHandler(AudioFileInputNode, IInspectable).initWithState(
-        audioComplete,
-        &context,
-    );
-    defer completed_handler.deinit();
-
-    const handler_handle = try file_input_node.addFileCompleted(completed_handler);
-    context.wait();
-    try file_input_node.removeFileCompleted(handler_handle);
+fn appendEffectDefinition(vector: *IVector(IAudioEffectDefinition), def_impl: anytype) !void {
+    var definition: ?*IAudioEffectDefinition = undefined;
+    defer _ = IUnknown.Release(@ptrCast(definition));
+    const _c = IUnknown.QueryInterface(@ptrCast(def_impl), &IAudioEffectDefinition.IID, @ptrCast(&definition));
+    if (definition == null or _c != 0) return error.NoInterface;
+    try vector.Append(definition.?);
 }
 
-fn createGraph(settings: *AudioGraphSettings) !*AudioGraph {
-    const graph_result = try AudioGraph.CreateAsync(settings);
-    defer _ = IUnknown.Release(@ptrCast(graph_result));
+pub const Graph = struct {
+    impl: *AudioGraph,
 
-    try awaitOperation(CreateAudioGraphResult, graph_result);
+    output: *AudioDeviceOutputNode,
+    input: std.ArrayList(Node) = .empty,
 
-    const result = try graph_result.GetResults();
-    errdefer _ = IUnknown.Release(@ptrCast(result));
+    pub fn init() !@This() {
+        const settings = try AudioGraphSettings.Create(.Media);
+        defer settings.deinit();
 
-    // check result
-    if (try result.getStatus() != .Success) return error.AudoGraphCreation;
+        const create_graph_task = try AudioGraph.CreateAsync(settings);
+        defer _ = IUnknown.Release(@ptrCast(create_graph_task));
+        try awaitOperation(CreateAudioGraphResult, create_graph_task);
+        const graph_result = try create_graph_task.GetResults();
+        errdefer _ = IUnknown.Release(@ptrCast(graph_result));
+        if (try graph_result.getStatus() != .Success) return error.AudoGraphCreation;
 
-    return try result.getGraph();
-}
+        const graph = try graph_result.getGraph();
+        errdefer _ = IUnknown.Release(@ptrCast(graph));
 
-fn createDeviceOutputNode(graph: *AudioGraph) !*AudioDeviceOutputNode {
-    var device_output_result = try graph.CreateDeviceOutputNodeAsync();
+        var device_output_result = try graph.CreateDeviceOutputNodeAsync();
+        try awaitOperation(CreateAudioDeviceOutputNodeResult, device_output_result);
+        const device_result = try device_output_result.GetResults();
+        defer _ = IUnknown.Release(@ptrCast(device_result));
+        if (try device_result.getStatus() != .Success) return error.AudioDeviceOutputNodeCreation;
 
-    try awaitOperation(CreateAudioDeviceOutputNodeResult, device_output_result);
+        const output = try device_result.getDeviceOutputNode();
 
-    const result = try device_output_result.GetResults();
-    defer _ = IUnknown.Release(@ptrCast(result));
+        try graph.Start();
 
-    if (try result.getStatus() != .Success) return error.AudioDeviceOutputNodeCreation;
+        return .{
+            .output = output,
+            .impl = graph,
+        };
+    }
 
-    return try result.getDeviceOutputNode();
-}
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        for (self.input.items) |item| item.deinit();
+        self.input.deinit(allocator);
 
-fn createFileInputNode(allocator: std.mem.Allocator, graph: *AudioGraph, path: []const u8) !*AudioFileInputNode {
-    const fullpath = try std.fs.cwd().realpathAlloc(allocator, path);
-    defer allocator.free(fullpath);
+        _ = IUnknown.Release(@ptrCast(self.output));
+        _ = IUnknown.Release(@ptrCast(self.impl));
+    }
 
-    const wpath = try std.unicode.utf8ToUtf16LeAllocZ(allocator, fullpath);
-    defer allocator.free(wpath);
+    pub fn createInput(self: *@This(), allocator: std.mem.Allocator, path: []const u8) !Node {
+        const node = try Node.init(allocator, self.impl, path, self.output);
+        errdefer node.deinit();
 
-    const h_path = try WindowsCreateString(wpath[0..wpath.len:0]);
-    defer WindowsDeleteString(h_path);
+        try self.input.append(allocator, node);
+        return self.input.getLast();
+    }
 
-    const file_task = try windows.Storage.StorageFile.GetFileFromPathAsync(h_path);
+    pub const Node = struct {
+        source: *AudioFileInputNode,
+        limiter: *LimiterEffectDefinition,
 
-    try awaitOperation(windows.Storage.StorageFile, file_task);
+        pub fn init(allocator: std.mem.Allocator, graph: *AudioGraph, path: []const u8, output: *AudioDeviceOutputNode) !@This() {
+            const fullpath = try std.fs.cwd().realpathAlloc(allocator, path);
+            defer allocator.free(fullpath);
 
-    const storage_file = try file_task.GetResults();
-    defer _ = IUnknown.Release(@ptrCast(storage_file));
+            const wpath = try std.unicode.utf8ToUtf16LeAllocZ(allocator, fullpath);
+            defer allocator.free(wpath);
 
-    var file_input_result = try graph.CreateFileInputNodeAsync(@ptrCast(storage_file));
+            const h_path = try WindowsCreateString(wpath[0..wpath.len:0]);
+            defer WindowsDeleteString(h_path);
 
-    try awaitOperation(CreateAudioFileInputNodeResult, file_input_result);
+            const file_task = try windows.Storage.StorageFile.GetFileFromPathAsync(h_path);
 
-    const result = try file_input_result.GetResults();
-    defer _ = IUnknown.Release(@ptrCast(result));
+            try awaitOperation(windows.Storage.StorageFile, file_task);
 
-    if (try result.getStatus() != .Success) return error.AudioFileInputNodeCreation;
+            const storage_file = try file_task.GetResults();
+            defer _ = IUnknown.Release(@ptrCast(storage_file));
 
-    return try result.getFileInputNode();
-}
+            var file_input_result = try graph.CreateFileInputNodeAsync(@ptrCast(storage_file));
+
+            try awaitOperation(CreateAudioFileInputNodeResult, file_input_result);
+
+            const result = try file_input_result.GetResults();
+            defer _ = IUnknown.Release(@ptrCast(result));
+
+            if (try result.getStatus() != .Success) return error.AudioFileInputNodeCreation;
+
+            const input_node = try result.getFileInputNode();
+
+            try input_node.putOutgoingGain(10.0);
+
+            const effect_defs = try input_node.getEffectDefinitions();
+            defer _ = IUnknown.Release(@ptrCast(effect_defs));
+
+            const limiter = try LimiterEffectDefinition.Create(graph);
+            try appendEffectDefinition(effect_defs, limiter);
+
+            var output_node: ?*IAudioNode = undefined;
+            defer _ = IUnknown.Release(@ptrCast(output_node));
+            const _c = IUnknown.QueryInterface(@ptrCast(output), &IAudioNode.IID, @ptrCast(&output_node));
+            if (output_node == null or _c != 0) return error.NoInterface;
+
+            try input_node.AddOutgoingConnection(output_node.?);
+
+            return .{
+                .source = input_node,
+                .limiter = limiter,
+            };
+        }
+
+        pub fn deinit(self: @This()) void {
+            _ = IUnknown.Release(@ptrCast(self.source));
+            _ = IUnknown.Release(@ptrCast(self.limiter));
+        }
+
+        pub fn isPlaying(self: *@This()) !void {
+            return (try self.source.getPlaybackSpeedFactor()) > 0;
+        }
+
+        pub fn start(self: *@This()) !void {
+            try self.source.Start();
+        }
+
+        pub fn stop(self: *@This()) !void {
+            try self.source.Stop();
+        }
+
+        pub fn reset(self: *@This()) !void {
+            try self.source.Reset();
+        }
+
+        pub fn getDuration(self: *@This()) !i64 {
+            return (try self.source.getDuration()).Duration;
+        }
+
+        pub fn getPosition(self: *@This()) !i64 {
+            return (try self.source.getPosition()).Duration;
+        }
+
+        pub fn getSpeed(self: *@This()) !f64 {
+            return (try self.source.getPlaybackSpeedFactor());
+        }
+
+        pub fn getLoopCount(self: *@This()) !i32 {
+            return (try self.source.getLoopCount());
+        }
+
+        pub fn seek(self: *@This(), position: i64) !void {
+            return (try self.source.Seek(.{ .Duration = position }));
+        }
+
+        pub fn getStartTime(self: *@This()) !i64 {
+            return (try (try self.source.getStartTime()).getValue()).Duration;
+        }
+
+        pub fn getEndTime(self: *@This()) !i64 {
+            return (try (try self.source.getEndTime()).getValue()).Duration;
+        }
+
+        pub fn setVolume(self: *@This(), volume: u32) !void {
+            if (volume == 0) {
+                try self.source.putOutgoingGain(0.0);
+                return;
+            } else if (try self.source.getOutgoingGain() == 0.0) {
+                try self.source.putOutgoingGain(10.0);
+            }
+
+            try self.limiter.putLoudness(volume);
+        }
+
+        pub fn wait(self: *@This()) !void {
+            var context: AsyncContext = .{};
+            var completed_handler = try TypedEventHandler(AudioFileInputNode, IInspectable).initWithState(
+                audioComplete,
+                &context,
+            );
+            defer completed_handler.deinit();
+
+            const handler_handle = try self.source.addFileCompleted(completed_handler);
+            context.wait();
+            try self.source.removeFileCompleted(handler_handle);
+        }
+    };
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const settings = try AudioGraphSettings.Create(.Media);
-    defer settings.deinit();
+    const volume: u32 = 100;
 
-    const graph = try createGraph(settings);
-    defer graph.deinit();
+    var graph = try Graph.init();
+    defer graph.deinit(allocator);
 
-    const device_output = try createDeviceOutputNode(graph);
-    defer _ = IUnknown.Release(@ptrCast(device_output));
-
-    const file_input_node = try createFileInputNode(allocator, graph, "assets/lizard.wav");
-    defer _ = IUnknown.Release(@ptrCast(file_input_node));
-
-    var output: ?*IAudioNode = undefined;
-    var _c = IUnknown.QueryInterface(@ptrCast(device_output), &IAudioNode.IID, @ptrCast(&output));
-    if (output == null or _c != 0) return error.NoInterface;
-
-    try file_input_node.AddOutgoingConnection(output.?);
-
-    const limiter = try LimiterEffectDefinition.Create(graph);
-    defer _ = IUnknown.Release(@ptrCast(limiter));
-
-    var volume: u32 = 20;
-    const gain: f64 = 10.0;
-    try limiter.putLoudness(volume);
-
-    var limiter_def: ?*IAudioEffectDefinition = undefined;
-    _c = IUnknown.QueryInterface(@ptrCast(limiter), &IAudioEffectDefinition.IID, @ptrCast(&limiter_def));
-    if (limiter_def == null or _c != 0) return error.NoInterface;
-
-    var effect_defs = try file_input_node.getEffectDefinitions();
-    defer _ = IUnknown.Release(@ptrCast(effect_defs));
-
-    try effect_defs.Append(limiter_def.?);
-
-    var playing = true;
-
-    try graph.Start();
-
-    try file_input_node.putOutgoingGain(gain);
-    try file_input_node.Start();
-
-    // TimeSpan
-    // const end = (try file_input_node.getEndTime()).getValue();
-
-    var event_loop = try EventLoop.init(allocator);
-    defer event_loop.deinit();
-
-    var title = try std.fmt.allocPrint(allocator, "{s} - {d}%", .{ if (playing) "Playing" else "paused", volume });
-    defer allocator.free(title);
-
-    _ = try event_loop.createWindow(.{ .title=title, .width = 800, .height = 600 });
-
-    while(event_loop.isActive()) {
-        if (event_loop.poll()) |data| {
-            switch (data.event) {
-                .close => event_loop.closeWindow(data.window.id()),
-                .key_input => |ke| {
-                    if (ke.matches(.up, .{})) {
-                        if (volume == 100) continue;
-
-                        if (volume == 0) {
-                            volume = 5;
-                            try file_input_node.putOutgoingGain(gain);
-                        } else {
-                            volume = @min(volume + 5, 100);
-                            try limiter.putLoudness(volume);
-                        }
-
-                        allocator.free(title);
-                        title = try std.fmt.allocPrint(allocator, "{s} - {d}%", .{ if (playing) "Playing" else "Paused", volume });
-                        try data.window.setTitle(title);
-                    } else if (ke.matches(.down, .{})) {
-                        if (volume == 0) continue;
-
-                        if (volume == 5) {
-                            volume = 0;
-                            try file_input_node.putOutgoingGain(0.0);
-                        } else {
-                            volume -|= 5;
-                            try limiter.putLoudness(volume);
-                        }
-
-                        allocator.free(title);
-                        title = try std.fmt.allocPrint(allocator, "{s} - {d}%", .{ if (playing) "Playing" else "Paused", volume });
-                        try data.window.setTitle(title);
-                    } else if (ke.matches(' ', .{})) {
-                        defer playing = !playing;
-                        if (playing)
-                            try file_input_node.Stop()
-                        else
-                            try file_input_node.Start();
-                        allocator.free(title);
-                        title = try std.fmt.allocPrint(allocator, "{s} - {d}%", .{ if (!playing) "Playing" else "Paused", volume });
-                        try data.window.setTitle(title);
-                    }
-                },
-                else => {}
-            }
-        }
-    }
+    var lizard = try graph.createInput(allocator, "assets/lizard.wav");
+    try lizard.setVolume(volume);
+    try lizard.start();
+    try lizard.wait();
 }

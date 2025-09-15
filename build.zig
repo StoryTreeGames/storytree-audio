@@ -5,7 +5,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const windows_zig = b.dependency("windows", .{});
-    const storytree_core = b.dependency("storytree_core", .{});
 
     const mod = b.addModule("audio", .{
         .root_source_file = b.path("src/root.zig"),
@@ -22,7 +21,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "audio", .module = mod },
                 .{ .name = "windows", .module = windows_zig.module("windows") },
-                .{ .name = "storytree-core", .module = storytree_core.module("storytree-core") },
             },
         }),
     });
