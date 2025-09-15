@@ -67,27 +67,6 @@ fn audioComplete(state: ?*anyopaque, result: *AudioFileInputNode, _: *IInspectab
     ctx.post();
 }
 
-fn awaitOperation(T: type, op: *IAsyncOperation(T)) !void {
-    const asyncComplete = (struct {
-        pub fn asyncComplete(state: ?*anyopaque, result: *IAsyncOperation(T), status: AsyncStatus) void {
-            _ = result;
-            _ = status;
-            const ctx: *AsyncContext = @ptrCast(@alignCast(state.?));
-            ctx.post();
-        }
-    }).asyncComplete;
-
-    var async_context: AsyncContext = .{};
-    const async_handler = try AsyncOperationCompletedHandler(T).initWithState(
-        asyncComplete,
-        &async_context,
-    );
-    defer async_handler.deinit();
-
-    try op.putCompleted(async_handler);
-    async_context.wait();
-}
-
 fn appendEffectDefinition(vector: *IVector(IAudioEffectDefinition), def_impl: anytype) !void {
     var definition: ?*IAudioEffectDefinition = undefined;
     defer _ = IUnknown.Release(@ptrCast(definition));
@@ -108,7 +87,8 @@ pub const Graph = struct {
 
         const create_graph_task = try AudioGraph.CreateAsync(settings);
         defer _ = IUnknown.Release(@ptrCast(create_graph_task));
-        try awaitOperation(CreateAudioGraphResult, create_graph_task);
+        try create_graph_task.wait();
+
         const graph_result = try create_graph_task.GetResults();
         errdefer _ = IUnknown.Release(@ptrCast(graph_result));
         if (try graph_result.getStatus() != .Success) return error.AudoGraphCreation;
@@ -116,9 +96,11 @@ pub const Graph = struct {
         const graph = try graph_result.getGraph();
         errdefer _ = IUnknown.Release(@ptrCast(graph));
 
-        var device_output_result = try graph.CreateDeviceOutputNodeAsync();
-        try awaitOperation(CreateAudioDeviceOutputNodeResult, device_output_result);
-        const device_result = try device_output_result.GetResults();
+        var device_output_task = try graph.CreateDeviceOutputNodeAsync();
+        defer _ = IUnknown.Release(@ptrCast(device_output_task));
+        try device_output_task.wait();
+
+        const device_result = try device_output_task.GetResults();
         defer _ = IUnknown.Release(@ptrCast(device_result));
         if (try device_result.getStatus() != .Success) return error.AudioDeviceOutputNodeCreation;
 
@@ -163,17 +145,17 @@ pub const Graph = struct {
             defer WindowsDeleteString(h_path);
 
             const file_task = try windows.Storage.StorageFile.GetFileFromPathAsync(h_path);
-
-            try awaitOperation(windows.Storage.StorageFile, file_task);
+            defer _ = IUnknown.Release(@ptrCast(file_task));
+            try file_task.wait();
 
             const storage_file = try file_task.GetResults();
             defer _ = IUnknown.Release(@ptrCast(storage_file));
 
-            var file_input_result = try graph.CreateFileInputNodeAsync(@ptrCast(storage_file));
+            var file_input_task = try graph.CreateFileInputNodeAsync(@ptrCast(storage_file));
+            defer _ = IUnknown.Release(@ptrCast(file_input_task));
+            try file_input_task.wait();
 
-            try awaitOperation(CreateAudioFileInputNodeResult, file_input_result);
-
-            const result = try file_input_result.GetResults();
+            const result = try file_input_task.GetResults();
             defer _ = IUnknown.Release(@ptrCast(result));
 
             if (try result.getStatus() != .Success) return error.AudioFileInputNodeCreation;
