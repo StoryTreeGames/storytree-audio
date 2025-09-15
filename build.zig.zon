@@ -32,8 +32,8 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{ .windows = .{
-        .url = "git+https://github.com/Tired-Fox/windows-zig#604733fb6200db4d48c80bc9d87f81eeb63f1d0d",
-        .hash = "windows-0.0.0-kXMVSuCOHwKOaN8ebvpaCFHb9Oy8Mm_mKUkrNTtLNyNF",
+        .url = "git+https://github.com/Tired-Fox/windows-zig#fdfd13d690050de7bc80ebef6b8775cbe1fcb786",
+        .hash = "windows-0.0.0-kXMVSknEUQIGlSiAlUbgTWhJbvM2FPkPzS6KwwlEBR3Q",
     } },
     .paths = .{
         "build.zig",

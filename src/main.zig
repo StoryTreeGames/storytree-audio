@@ -30,16 +30,6 @@ const EchoEffectDefinition = windows.Media.Audio.EchoEffectDefinition;
 const IUnknown = windows.IUnknown;
 const HSTRING = windows.HSTRING;
 
-const AsyncContext = struct {
-    semaphore: std.Thread.Semaphore = .{},
-    pub fn post(self: *@This()) void {
-        self.semaphore.post();
-    }
-    pub fn wait(self: *@This()) void {
-        self.semaphore.wait();
-    }
-};
-
 pub fn WindowsCreateString(string: [:0]const u16) !?HSTRING {
     var result: ?HSTRING = undefined;
     if (win32.system.win_rt.WindowsCreateString(string.ptr, @intCast(string.len), &result) != 0) {
@@ -63,16 +53,8 @@ pub fn WindowsGetString(string: ?HSTRING) ?[]const u16 {
 
 fn audioComplete(state: ?*anyopaque, result: *AudioFileInputNode, _: *IInspectable) void {
     _ = result;
-    const ctx: *AsyncContext = @ptrCast(@alignCast(state.?));
+    const ctx: *std.Thread.Semaphore = @ptrCast(@alignCast(state.?));
     ctx.post();
-}
-
-fn appendEffectDefinition(vector: *IVector(IAudioEffectDefinition), def_impl: anytype) !void {
-    var definition: ?*IAudioEffectDefinition = undefined;
-    defer _ = IUnknown.Release(@ptrCast(definition));
-    const _c = IUnknown.QueryInterface(@ptrCast(def_impl), &IAudioEffectDefinition.IID, @ptrCast(&definition));
-    if (definition == null or _c != 0) return error.NoInterface;
-    try vector.Append(definition.?);
 }
 
 pub const Graph = struct {
@@ -86,22 +68,22 @@ pub const Graph = struct {
         defer settings.deinit();
 
         const create_graph_task = try AudioGraph.CreateAsync(settings);
-        defer _ = IUnknown.Release(@ptrCast(create_graph_task));
+        defer create_graph_task.deinit();
         try create_graph_task.wait();
 
         const graph_result = try create_graph_task.GetResults();
-        errdefer _ = IUnknown.Release(@ptrCast(graph_result));
+        defer graph_result.deinit();
         if (try graph_result.getStatus() != .Success) return error.AudoGraphCreation;
 
         const graph = try graph_result.getGraph();
-        errdefer _ = IUnknown.Release(@ptrCast(graph));
+        errdefer graph.deinit();
 
         var device_output_task = try graph.CreateDeviceOutputNodeAsync();
-        defer _ = IUnknown.Release(@ptrCast(device_output_task));
+        defer device_output_task.deinit();
         try device_output_task.wait();
 
         const device_result = try device_output_task.GetResults();
-        defer _ = IUnknown.Release(@ptrCast(device_result));
+        defer device_result.deinit();
         if (try device_result.getStatus() != .Success) return error.AudioDeviceOutputNodeCreation;
 
         const output = try device_result.getDeviceOutputNode();
@@ -118,8 +100,8 @@ pub const Graph = struct {
         for (self.input.items) |item| item.deinit();
         self.input.deinit(allocator);
 
-        _ = IUnknown.Release(@ptrCast(self.output));
-        _ = IUnknown.Release(@ptrCast(self.impl));
+        self.output.deinit();
+        self.impl.deinit();
     }
 
     pub fn createInput(self: *@This(), allocator: std.mem.Allocator, path: []const u8) !Node {
@@ -145,18 +127,18 @@ pub const Graph = struct {
             defer WindowsDeleteString(h_path);
 
             const file_task = try windows.Storage.StorageFile.GetFileFromPathAsync(h_path);
-            defer _ = IUnknown.Release(@ptrCast(file_task));
+            defer file_task.deinit();
             try file_task.wait();
 
             const storage_file = try file_task.GetResults();
-            defer _ = IUnknown.Release(@ptrCast(storage_file));
+            defer storage_file.deinit();
 
             var file_input_task = try graph.CreateFileInputNodeAsync(@ptrCast(storage_file));
-            defer _ = IUnknown.Release(@ptrCast(file_input_task));
+            defer file_input_task.deinit();
             try file_input_task.wait();
 
             const result = try file_input_task.GetResults();
-            defer _ = IUnknown.Release(@ptrCast(result));
+            defer result.deinit();
 
             if (try result.getStatus() != .Success) return error.AudioFileInputNodeCreation;
 
@@ -165,13 +147,13 @@ pub const Graph = struct {
             try input_node.putOutgoingGain(10.0);
 
             const effect_defs = try input_node.getEffectDefinitions();
-            defer _ = IUnknown.Release(@ptrCast(effect_defs));
+            defer effect_defs.deinit();
 
             const limiter = try LimiterEffectDefinition.Create(graph);
-            try appendEffectDefinition(effect_defs, limiter);
+            try effect_defs.Append(try limiter.cast(IAudioEffectDefinition));
 
             var output_node: ?*IAudioNode = undefined;
-            defer _ = IUnknown.Release(@ptrCast(output_node));
+            defer output_node.?.deinit();
             const _c = IUnknown.QueryInterface(@ptrCast(output), &IAudioNode.IID, @ptrCast(&output_node));
             if (output_node == null or _c != 0) return error.NoInterface;
 
@@ -184,8 +166,8 @@ pub const Graph = struct {
         }
 
         pub fn deinit(self: @This()) void {
-            _ = IUnknown.Release(@ptrCast(self.source));
-            _ = IUnknown.Release(@ptrCast(self.limiter));
+            self.source.deinit();
+            self.limiter.deinit();
         }
 
         pub fn isPlaying(self: *@This()) !void {
@@ -244,7 +226,7 @@ pub const Graph = struct {
         }
 
         pub fn wait(self: *@This()) !void {
-            var context: AsyncContext = .{};
+            var context: std.Thread.Semaphore = .{};
             var completed_handler = try TypedEventHandler(AudioFileInputNode, IInspectable).initWithState(
                 audioComplete,
                 &context,
